@@ -24,6 +24,9 @@ import type {
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
+const MAX_TOOL_EXECUTION_ATTEMPTS = 10;
+const MAX_STEP_REPEAT_ATTEMPTS = 10;
+
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
@@ -163,6 +166,7 @@ async function runLoop(
 	let firstTurn = true;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	let stepRepeatAttempts = 0;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -188,10 +192,13 @@ async function runLoop(
 			}
 
 			// Stream assistant response
+			const stepContextStart = currentContext.messages.length;
+			const stepNewMessagesStart = newMessages.length;
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				await emit({ type: "message_end", message });
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -203,17 +210,38 @@ async function runLoop(
 			const toolResults: ToolResultMessage[] = [];
 			hasMoreToolCalls = false;
 			if (toolCalls.length > 0) {
-				const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
+				const executedToolBatch = await executeToolCalls(
+					currentContext,
+					message,
+					config,
+					signal,
+					emit,
+					stepRepeatAttempts,
+				);
+				if (executedToolBatch.retry === "step") {
+					stepRepeatAttempts++;
+					currentContext.messages.splice(stepContextStart);
+					newMessages.splice(stepNewMessagesStart);
+					pendingMessages = executedToolBatch.injectMessages;
+					firstTurn = true;
+					continue;
+				}
+
 				toolResults.push(...executedToolBatch.messages);
 				hasMoreToolCalls = !executedToolBatch.terminate;
 
+				await emit({ type: "message_end", message });
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
+					await emitToolResultMessage(result, emit);
 				}
+			} else {
+				await emit({ type: "message_end", message });
 			}
 
 			await emit({ type: "turn_end", message, toolResults });
+			stepRepeatAttempts = 0;
 
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
 		}
@@ -315,7 +343,6 @@ async function streamAssistantResponse(
 				if (!addedPartial) {
 					await emit({ type: "message_start", message: { ...finalMessage } });
 				}
-				await emit({ type: "message_end", message: finalMessage });
 				return finalMessage;
 			}
 		}
@@ -328,7 +355,6 @@ async function streamAssistantResponse(
 		context.messages.push(finalMessage);
 		await emit({ type: "message_start", message: { ...finalMessage } });
 	}
-	await emit({ type: "message_end", message: finalMessage });
 	return finalMessage;
 }
 
@@ -341,20 +367,38 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	stepRepeatAttempts: number,
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
 	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
-		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit, stepRepeatAttempts);
 	}
-	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit, stepRepeatAttempts);
 }
 
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
+	retry: "none" | "step";
+	injectMessages: AgentMessage[];
+};
+
+type FinalizedToolCallDecision =
+	| {
+			retry: "none";
+			finalized: FinalizedToolCallOutcome;
+	  }
+	| {
+			retry: "step";
+			injectMessages: AgentMessage[];
+	  };
+
+type ToolCallAttemptAction = {
+	retry: "none" | "tool" | "step";
+	injectMessages: AgentMessage[];
 };
 
 async function executeToolCallsSequential(
@@ -364,6 +408,7 @@ async function executeToolCallsSequential(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	stepRepeatAttempts: number,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
@@ -385,20 +430,28 @@ async function executeToolCallsSequential(
 				isError: preparation.isError,
 			};
 		} else {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
-			finalized = await finalizeExecutedToolCall(
+			const decision = await executePreparedToolCallWithRetries(
 				currentContext,
 				assistantMessage,
 				preparation,
-				executed,
 				config,
 				signal,
+				emit,
+				stepRepeatAttempts,
 			);
+			if (decision.retry === "step") {
+				return {
+					messages: [],
+					terminate: false,
+					retry: "step",
+					injectMessages: decision.injectMessages,
+				};
+			}
+			finalized = decision.finalized;
 		}
 
 		await emitToolExecutionEnd(finalized, emit);
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
 	}
@@ -406,6 +459,8 @@ async function executeToolCallsSequential(
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(finalizedCalls),
+		retry: "none",
+		injectMessages: [],
 	};
 }
 
@@ -416,6 +471,7 @@ async function executeToolCallsParallel(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	stepRepeatAttempts: number,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
 
@@ -435,38 +491,56 @@ async function executeToolCallsParallel(
 				isError: preparation.isError,
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
-			finalizedCalls.push(finalized);
+			finalizedCalls.push({ retry: "none", finalized });
 			continue;
 		}
 
 		finalizedCalls.push(async () => {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
-			const finalized = await finalizeExecutedToolCall(
+			const decision = await executePreparedToolCallWithRetries(
 				currentContext,
 				assistantMessage,
 				preparation,
-				executed,
 				config,
 				signal,
+				emit,
+				stepRepeatAttempts,
 			);
+			if (decision.retry === "step") {
+				return decision;
+			}
+			const finalized = decision.finalized;
 			await emitToolExecutionEnd(finalized, emit);
-			return finalized;
+			return { retry: "none", finalized };
 		});
 	}
 
-	const orderedFinalizedCalls = await Promise.all(
+	const orderedDecisions = await Promise.all(
 		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	);
+	const stepRetry = orderedDecisions.find((decision) => decision.retry === "step");
+	if (stepRetry) {
+		return {
+			messages: [],
+			terminate: false,
+			retry: "step",
+			injectMessages: stepRetry.injectMessages,
+		};
+	}
+
+	const orderedFinalizedCalls = orderedDecisions.flatMap((decision) =>
+		decision.retry === "none" ? [decision.finalized] : [],
 	);
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
 	}
 
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		retry: "none",
+		injectMessages: [],
 	};
 }
 
@@ -494,7 +568,7 @@ type FinalizedToolCallOutcome = {
 	isError: boolean;
 };
 
-type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
+type FinalizedToolCallEntry = FinalizedToolCallDecision | (() => Promise<FinalizedToolCallDecision>);
 
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
 	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
@@ -601,6 +675,125 @@ async function executePreparedToolCall(
 			isError: true,
 		};
 	}
+}
+
+async function executePreparedToolCallWithRetries(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	prepared: PreparedToolCall,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	stepRepeatAttempts: number,
+): Promise<FinalizedToolCallDecision> {
+	let attempt = 1;
+
+	while (true) {
+		const executed = await executePreparedToolCall(prepared, signal, emit);
+		let action: ToolCallAttemptAction;
+		try {
+			action = await getToolCallAttemptAction(currentContext, assistantMessage, prepared, executed, attempt, config, signal);
+		} catch (error) {
+			const hookFailed = {
+				result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+				isError: true,
+			};
+			const finalized = await finalizeExecutedToolCall(
+				currentContext,
+				assistantMessage,
+				prepared,
+				hookFailed,
+				config,
+				signal,
+			);
+			return { retry: "none", finalized };
+		}
+
+		if (action.retry === "step") {
+			if (stepRepeatAttempts >= MAX_STEP_REPEAT_ATTEMPTS) {
+				const retryLimitExceeded = {
+					result: createErrorToolResult(
+						`Assistant step retry limit exceeded after ${stepRepeatAttempts} retries`,
+					),
+					isError: true,
+				};
+				const finalized = await finalizeExecutedToolCall(
+					currentContext,
+					assistantMessage,
+					prepared,
+					retryLimitExceeded,
+					config,
+					signal,
+				);
+				return { retry: "none", finalized };
+			}
+			return {
+				retry: "step",
+				injectMessages: action.injectMessages,
+			};
+		}
+
+		if (action.retry === "tool") {
+			if (attempt >= MAX_TOOL_EXECUTION_ATTEMPTS) {
+				const retryLimitExceeded = {
+					result: createErrorToolResult(`Tool execution retry limit exceeded after ${attempt} attempts`),
+					isError: true,
+				};
+				const finalized = await finalizeExecutedToolCall(
+					currentContext,
+					assistantMessage,
+					prepared,
+					retryLimitExceeded,
+					config,
+					signal,
+				);
+				return { retry: "none", finalized };
+			}
+			attempt++;
+			continue;
+		}
+
+		const finalized = await finalizeExecutedToolCall(
+			currentContext,
+			assistantMessage,
+			prepared,
+			executed,
+			config,
+			signal,
+		);
+		return { retry: "none", finalized };
+	}
+}
+
+async function getToolCallAttemptAction(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	prepared: PreparedToolCall,
+	executed: ExecutedToolCallOutcome,
+	attempt: number,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): Promise<ToolCallAttemptAction> {
+	if (!config.afterToolExecution) {
+		return { retry: "none", injectMessages: [] };
+	}
+
+	const result = await config.afterToolExecution(
+		{
+			assistantMessage,
+			toolCall: prepared.toolCall,
+			args: prepared.args,
+			attempt,
+			result: executed.result,
+			isError: executed.isError,
+			context: currentContext,
+		},
+		signal,
+	);
+	return {
+		retry: result?.retry ?? "none",
+		injectMessages: result?.injectMessages ?? [],
+	};
 }
 
 async function finalizeExecutedToolCall(

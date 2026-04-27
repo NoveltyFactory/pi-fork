@@ -10,6 +10,8 @@ import {
 } from "@mariozechner/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.js";
 import type {
+	AfterToolExecutionContext,
+	AfterToolExecutionResult,
 	AfterToolCallContext,
 	AfterToolCallResult,
 	AgentContext,
@@ -100,6 +102,10 @@ export interface AgentOptions {
 	onPayload?: SimpleStreamOptions["onPayload"];
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+	afterToolExecution?: (
+		context: AfterToolExecutionContext,
+		signal?: AbortSignal,
+	) => Promise<AfterToolExecutionResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
@@ -171,6 +177,10 @@ export class Agent {
 		context: BeforeToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<BeforeToolCallResult | undefined>;
+	public afterToolExecution?: (
+		context: AfterToolExecutionContext,
+		signal?: AbortSignal,
+	) => Promise<AfterToolExecutionResult | undefined>;
 	public afterToolCall?: (
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
@@ -196,6 +206,7 @@ export class Agent {
 		this.onPayload = options.onPayload;
 		this.onResponse = options.onResponse;
 		this.beforeToolCall = options.beforeToolCall;
+		this.afterToolExecution = options.afterToolExecution;
 		this.afterToolCall = options.afterToolCall;
 		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
@@ -420,6 +431,7 @@ export class Agent {
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
+			afterToolExecution: this.afterToolExecution,
 			afterToolCall: this.afterToolCall,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,

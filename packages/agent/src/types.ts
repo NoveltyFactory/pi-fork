@@ -49,6 +49,7 @@ export interface BeforeToolCallResult {
 	reason?: string;
 }
 
+
 /**
  * Partial override returned from `afterToolCall`.
  *
@@ -70,6 +71,13 @@ export interface AfterToolCallResult {
 	 * Early termination only happens when every finalized tool result in the batch sets this to true.
 	 */
 	terminate?: boolean;
+}
+
+export type ToolExecutionRetry = "none" | "tool" | "step";
+
+export interface AfterToolExecutionResult {
+	retry: ToolExecutionRetry;
+	injectMessages?: AgentMessage[];
 }
 
 /** Context passed to `beforeToolCall`. */
@@ -97,6 +105,24 @@ export interface AfterToolCallContext {
 	/** Whether the executed tool result is currently treated as an error. */
 	isError: boolean;
 	/** Current agent context at the time the tool call is finalized. */
+	context: AgentContext;
+}
+
+/** Context passed after one physical tool execution attempt finishes. */
+export interface AfterToolExecutionContext {
+	/** The assistant message that requested the tool call. */
+	assistantMessage: AssistantMessage;
+	/** The raw tool call block from `assistantMessage.content`. */
+	toolCall: AgentToolCall;
+	/** Validated tool arguments for the target tool schema. */
+	args: unknown;
+	/** 1-based physical execution attempt number for this tool call. */
+	attempt: number;
+	/** The executed tool result for this attempt. */
+	result: AgentToolResult<any>;
+	/** Whether this attempt is currently treated as an error. */
+	isError: boolean;
+	/** Current agent context at the time the tool execution attempt finished. */
 	context: AgentContext;
 }
 
@@ -207,6 +233,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+
+	/**
+	 * Called after one physical tool execution attempt finishes, before the result is finalized or emitted.
+	 *
+	 * Return `{ retry: "tool" }` to rerun the same prepared tool call locally.
+	 * Return `{ retry: "step", injectMessages }` to discard the assistant output that contained this tool call,
+	 * inject messages, and ask the LLM to produce that assistant step again.
+	 */
+	afterToolExecution?: (
+		context: AfterToolExecutionContext,
+		signal?: AbortSignal,
+	) => Promise<AfterToolExecutionResult | undefined>;
 
 	/**
 	 * Called after a tool finishes executing, before `tool_execution_end` and tool-result message events are emitted.
