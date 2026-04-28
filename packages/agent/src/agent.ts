@@ -23,6 +23,8 @@ import type {
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	StreamFn,
+	ToolCallHandlerContext,
+	ToolCallHandlerResult,
 	ToolExecutionMode,
 } from "./types.js";
 
@@ -102,6 +104,7 @@ export interface AgentOptions {
 	onPayload?: SimpleStreamOptions["onPayload"];
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+	handleToolCall?: (context: ToolCallHandlerContext, signal?: AbortSignal) => Promise<ToolCallHandlerResult | undefined>;
 	afterToolExecution?: (
 		context: AfterToolExecutionContext,
 		signal?: AbortSignal,
@@ -177,6 +180,10 @@ export class Agent {
 		context: BeforeToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<BeforeToolCallResult | undefined>;
+	public handleToolCall?: (
+		context: ToolCallHandlerContext,
+		signal?: AbortSignal,
+	) => Promise<ToolCallHandlerResult | undefined>;
 	public afterToolExecution?: (
 		context: AfterToolExecutionContext,
 		signal?: AbortSignal,
@@ -206,6 +213,7 @@ export class Agent {
 		this.onPayload = options.onPayload;
 		this.onResponse = options.onResponse;
 		this.beforeToolCall = options.beforeToolCall;
+		this.handleToolCall = options.handleToolCall;
 		this.afterToolExecution = options.afterToolExecution;
 		this.afterToolCall = options.afterToolCall;
 		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
@@ -431,6 +439,7 @@ export class Agent {
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
+			handleToolCall: this.handleToolCall,
 			afterToolExecution: this.afterToolExecution,
 			afterToolCall: this.afterToolCall,
 			convertToLlm: this.convertToLlm,

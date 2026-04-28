@@ -38,6 +38,25 @@ export type ToolExecutionMode = "sequential" | "parallel";
 /** A single tool call content block emitted by an assistant message. */
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 
+export type DispatchStatus = "success" | "failure" | "aborted" | "limited";
+
+export interface DispatchRequest {
+	from: "root" | "current";
+	messages: AgentMessage[];
+	maxSteps?: number;
+	maxDepth?: number;
+}
+
+export interface DispatchResult {
+	status: DispatchStatus;
+	reason?: string;
+	messages: AgentMessage[];
+	toolResults: ToolResultMessage[];
+	error?: unknown;
+}
+
+export type DispatchFn = (request: DispatchRequest) => Promise<DispatchResult>;
+
 /**
  * Result returned from `beforeToolCall`.
  *
@@ -49,6 +68,17 @@ export interface BeforeToolCallResult {
 	reason?: string;
 }
 
+export type ToolCallHandlerStatus = "execute" | DispatchStatus;
+
+export type ToolCallHandlerResult =
+	| {
+			status: "execute";
+			arguments?: unknown;
+	  }
+	| {
+			status: DispatchStatus;
+			result: AgentToolResult<any>;
+	  };
 
 /**
  * Partial override returned from `afterToolCall`.
@@ -90,6 +120,11 @@ export interface BeforeToolCallContext {
 	args: unknown;
 	/** Current agent context at the time the tool call is prepared. */
 	context: AgentContext;
+}
+
+export interface ToolCallHandlerContext extends BeforeToolCallContext {
+	/** Runs an isolated branch from either the root or current context. */
+	dispatch: DispatchFn;
 }
 
 /** Context passed to `afterToolCall`. */
@@ -233,6 +268,19 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+
+	/**
+	 * Optionally handles a tool call in place of executing the matching tool.
+	 *
+	 * Use this for macro tools that dispatch one or more isolated branches and assemble
+	 * a tool result. Return `{ status: "execute" }` to run the original tool, optionally
+	 * with replacement arguments. Return a dispatch status with `result` to replace the
+	 * tool call. Return undefined to let the normal tool execution path continue.
+	 */
+	handleToolCall?: (
+		context: ToolCallHandlerContext,
+		signal?: AbortSignal,
+	) => Promise<ToolCallHandlerResult | undefined>;
 
 	/**
 	 * Called after one physical tool execution attempt finishes, before the result is finalized or emitted.

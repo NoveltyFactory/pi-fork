@@ -19,6 +19,9 @@ import type {
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
+	DispatchRequest,
+	DispatchResult,
+	DispatchStatus,
 	StreamFn,
 } from "./types.js";
 
@@ -26,6 +29,25 @@ export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 const MAX_TOOL_EXECUTION_ATTEMPTS = 10;
 const MAX_STEP_REPEAT_ATTEMPTS = 10;
+const DEFAULT_DISPATCH_MAX_DEPTH = 8;
+
+type LoopCompletion = {
+	status: DispatchStatus;
+	reason?: string;
+	toolResults: ToolResultMessage[];
+};
+
+type LoopRunOptions = {
+	rootContext?: AgentContext;
+	remainingDispatchDepth?: number;
+	maxSteps?: number;
+};
+
+type LoopRuntime = {
+	rootContext: AgentContext;
+	remainingDispatchDepth: number;
+	streamFn?: StreamFn;
+};
 
 /**
  * Start an agent loop with a new prompt message.
@@ -116,7 +138,9 @@ export async function runAgentLoop(
 		await emit({ type: "message_end", message: prompt });
 	}
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn);
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn, {
+		rootContext: shallowCloneAgentContext(context),
+	});
 	return newMessages;
 }
 
@@ -141,7 +165,9 @@ export async function runAgentLoopContinue(
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn);
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn, {
+		rootContext: shallowCloneAgentContext(context),
+	});
 	return newMessages;
 }
 
@@ -162,11 +188,19 @@ async function runLoop(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
-): Promise<void> {
+	options: LoopRunOptions = {},
+): Promise<LoopCompletion> {
 	let firstTurn = true;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 	let stepRepeatAttempts = 0;
+	let stepsUsed = 0;
+	const producedToolOutcomes: ToolResultOutcome[] = [];
+	const runtime: LoopRuntime = {
+		rootContext: options.rootContext ?? shallowCloneAgentContext(currentContext),
+		remainingDispatchDepth: options.remainingDispatchDepth ?? DEFAULT_DISPATCH_MAX_DEPTH,
+		streamFn,
+	};
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -192,22 +226,30 @@ async function runLoop(
 			}
 
 			// Stream assistant response
+			if (options.maxSteps !== undefined && stepsUsed >= options.maxSteps) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return { status: "limited", reason: "maxSteps", toolResults: getToolResultMessages(producedToolOutcomes) };
+			}
 			const stepContextStart = currentContext.messages.length;
 			const stepNewMessagesStart = newMessages.length;
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
+			stepsUsed++;
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				await emit({ type: "message_end", message });
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
-				return;
+				return {
+					status: message.stopReason === "aborted" ? "aborted" : "failure",
+					reason: getAssistantErrorMessage(message),
+					toolResults: getToolResultMessages(producedToolOutcomes),
+				};
 			}
 
 			// Check for tool calls
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 
-			const toolResults: ToolResultMessage[] = [];
 			hasMoreToolCalls = false;
 			if (toolCalls.length > 0) {
 				const executedToolBatch = await executeToolCalls(
@@ -217,6 +259,7 @@ async function runLoop(
 					signal,
 					emit,
 					stepRepeatAttempts,
+					runtime,
 				);
 				if (executedToolBatch.retry === "step") {
 					stepRepeatAttempts++;
@@ -227,20 +270,33 @@ async function runLoop(
 					continue;
 				}
 
-				toolResults.push(...executedToolBatch.messages);
+				producedToolOutcomes.push(...executedToolBatch.outcomes);
 				hasMoreToolCalls = !executedToolBatch.terminate;
 
 				await emit({ type: "message_end", message });
+				const toolResults = getToolResultMessages(executedToolBatch.outcomes);
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
 					await emitToolResultMessage(result, emit);
 				}
+				await emit({ type: "turn_end", message, toolResults });
+				if (options.maxSteps !== undefined && stepsUsed >= options.maxSteps && hasMoreToolCalls) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return {
+						status: "limited",
+						reason: "maxSteps",
+						toolResults: getToolResultMessages(producedToolOutcomes),
+					};
+				}
+				stepRepeatAttempts = 0;
+				pendingMessages = (await config.getSteeringMessages?.()) || [];
+				continue;
 			} else {
 				await emit({ type: "message_end", message });
 			}
 
-			await emit({ type: "turn_end", message, toolResults });
+			await emit({ type: "turn_end", message, toolResults: [] });
 			stepRepeatAttempts = 0;
 
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
@@ -259,6 +315,106 @@ async function runLoop(
 	}
 
 	await emit({ type: "agent_end", messages: newMessages });
+	return {
+		status: getDispatchStatus("success", producedToolOutcomes),
+		toolResults: getToolResultMessages(producedToolOutcomes),
+	};
+}
+
+async function runBranch(
+	request: DispatchRequest,
+	currentContext: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	runtime: LoopRuntime,
+): Promise<DispatchResult> {
+	const requestedDepth = request.maxDepth ?? runtime.remainingDispatchDepth;
+	const allowedDepth = Math.min(requestedDepth, runtime.remainingDispatchDepth);
+	if (allowedDepth <= 0) {
+		return {
+			status: "limited",
+			reason: "maxDepth",
+			messages: [],
+			toolResults: [],
+		};
+	}
+
+	const baseContext = request.from === "root" ? runtime.rootContext : currentContext;
+	const branchRootContext = shallowCloneAgentContext(baseContext);
+	const branchContext = shallowCloneAgentContext(baseContext);
+	branchContext.messages = [...baseContext.messages, ...request.messages];
+	const branchMessages: AgentMessage[] = [...request.messages];
+	const branchConfig: AgentLoopConfig = {
+		...config,
+		getSteeringMessages: undefined,
+		getFollowUpMessages: undefined,
+	};
+
+	try {
+		const completion = await runLoop(
+			branchContext,
+			branchMessages,
+			branchConfig,
+			signal,
+			async () => {},
+			runtime.streamFn,
+			{
+				rootContext: branchRootContext,
+				remainingDispatchDepth: allowedDepth - 1,
+				maxSteps: request.maxSteps,
+			},
+		);
+		return {
+			status: completion.status,
+			reason: completion.reason,
+			messages: branchMessages,
+			toolResults: completion.toolResults,
+		};
+	} catch (error) {
+		return {
+			status: "failure",
+			reason: error instanceof Error ? error.message : String(error),
+			messages: branchMessages,
+			toolResults: branchMessages.slice(request.messages.length).filter(isToolResultMessage),
+			error,
+		};
+	}
+}
+
+function getDispatchStatus(status: DispatchStatus, toolOutcomes: ToolResultOutcome[] = []): DispatchStatus {
+	if (status === "limited" || status === "aborted") {
+		return status;
+	}
+	if (toolOutcomes.some((toolOutcome) => toolOutcome.status === "aborted")) {
+		return "aborted";
+	}
+	if (toolOutcomes.some((toolOutcome) => toolOutcome.status === "limited")) {
+		return "limited";
+	}
+	if (status === "success" && toolOutcomes.some((toolOutcome) => toolOutcome.status === "failure")) {
+		return "failure";
+	}
+	return status;
+}
+
+function getToolResultMessages(toolOutcomes: ToolResultOutcome[]): ToolResultMessage[] {
+	return toolOutcomes.map((toolOutcome) => toolOutcome.message);
+}
+
+function shallowCloneAgentContext(context: AgentContext): AgentContext {
+	return {
+		...context,
+		messages: [...context.messages],
+		tools: context.tools ? [...context.tools] : undefined,
+	};
+}
+
+function isToolResultMessage(message: AgentMessage): message is ToolResultMessage {
+	return message.role === "toolResult";
+}
+
+function getAssistantErrorMessage(message: AssistantMessage): string | undefined {
+	return (message as AssistantMessage & { errorMessage?: string }).errorMessage;
 }
 
 /**
@@ -368,22 +524,37 @@ async function executeToolCalls(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	stepRepeatAttempts: number,
+	runtime: LoopRuntime,
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
 	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
-		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit, stepRepeatAttempts);
+		return executeToolCallsSequential(
+			currentContext,
+			assistantMessage,
+			toolCalls,
+			config,
+			signal,
+			emit,
+			stepRepeatAttempts,
+			runtime,
+		);
 	}
-	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit, stepRepeatAttempts);
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit, stepRepeatAttempts, runtime);
 }
 
 type ExecutedToolCallBatch = {
-	messages: ToolResultMessage[];
+	outcomes: ToolResultOutcome[];
 	terminate: boolean;
 	retry: "none" | "step";
 	injectMessages: AgentMessage[];
+};
+
+type ToolResultOutcome = {
+	message: ToolResultMessage;
+	status: DispatchStatus;
 };
 
 type FinalizedToolCallDecision =
@@ -409,9 +580,9 @@ async function executeToolCallsSequential(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	stepRepeatAttempts: number,
+	runtime: LoopRuntime,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
-	const messages: ToolResultMessage[] = [];
 
 	for (const toolCall of toolCalls) {
 		await emit({
@@ -421,13 +592,14 @@ async function executeToolCallsSequential(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal, runtime);
 		let finalized: FinalizedToolCallOutcome;
 		if (preparation.kind === "immediate") {
 			finalized = {
 				toolCall,
 				result: preparation.result,
 				isError: preparation.isError,
+				status: preparation.status,
 			};
 		} else {
 			const decision = await executePreparedToolCallWithRetries(
@@ -441,7 +613,7 @@ async function executeToolCallsSequential(
 			);
 			if (decision.retry === "step") {
 				return {
-					messages: [],
+					outcomes: [],
 					terminate: false,
 					retry: "step",
 					injectMessages: decision.injectMessages,
@@ -451,13 +623,11 @@ async function executeToolCallsSequential(
 		}
 
 		await emitToolExecutionEnd(finalized, emit);
-		const toolResultMessage = createToolResultMessage(finalized);
 		finalizedCalls.push(finalized);
-		messages.push(toolResultMessage);
 	}
 
 	return {
-		messages,
+		outcomes: finalizedCalls.map(createToolResultOutcome),
 		terminate: shouldTerminateToolBatch(finalizedCalls),
 		retry: "none",
 		injectMessages: [],
@@ -472,8 +642,10 @@ async function executeToolCallsParallel(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	stepRepeatAttempts: number,
+	runtime: LoopRuntime,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
+	const finalizedInCompletionOrder: FinalizedToolCallOutcome[] = [];
 
 	for (const toolCall of toolCalls) {
 		await emit({
@@ -483,14 +655,15 @@ async function executeToolCallsParallel(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal, runtime);
 		if (preparation.kind === "immediate") {
 			const finalized = {
 				toolCall,
 				result: preparation.result,
 				isError: preparation.isError,
+				status: preparation.status,
 			} satisfies FinalizedToolCallOutcome;
-			await emitToolExecutionEnd(finalized, emit);
+			finalizedInCompletionOrder.push(finalized);
 			finalizedCalls.push({ retry: "none", finalized });
 			continue;
 		}
@@ -508,9 +681,8 @@ async function executeToolCallsParallel(
 			if (decision.retry === "step") {
 				return decision;
 			}
-			const finalized = decision.finalized;
-			await emitToolExecutionEnd(finalized, emit);
-			return { retry: "none", finalized };
+			finalizedInCompletionOrder.push(decision.finalized);
+			return { retry: "none", finalized: decision.finalized };
 		});
 	}
 
@@ -520,7 +692,7 @@ async function executeToolCallsParallel(
 	const stepRetry = orderedDecisions.find((decision) => decision.retry === "step");
 	if (stepRetry) {
 		return {
-			messages: [],
+			outcomes: [],
 			terminate: false,
 			retry: "step",
 			injectMessages: stepRetry.injectMessages,
@@ -530,14 +702,12 @@ async function executeToolCallsParallel(
 	const orderedFinalizedCalls = orderedDecisions.flatMap((decision) =>
 		decision.retry === "none" ? [decision.finalized] : [],
 	);
-	const messages: ToolResultMessage[] = [];
-	for (const finalized of orderedFinalizedCalls) {
-		const toolResultMessage = createToolResultMessage(finalized);
-		messages.push(toolResultMessage);
+	for (const finalized of finalizedInCompletionOrder) {
+		await emitToolExecutionEnd(finalized, emit);
 	}
 
 	return {
-		messages,
+		outcomes: orderedFinalizedCalls.map(createToolResultOutcome),
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
 		retry: "none",
 		injectMessages: [],
@@ -555,6 +725,7 @@ type ImmediateToolCallOutcome = {
 	kind: "immediate";
 	result: AgentToolResult<any>;
 	isError: boolean;
+	status?: DispatchStatus;
 };
 
 type ExecutedToolCallOutcome = {
@@ -566,6 +737,7 @@ type FinalizedToolCallOutcome = {
 	toolCall: AgentToolCall;
 	result: AgentToolResult<any>;
 	isError: boolean;
+	status?: DispatchStatus;
 };
 
 type FinalizedToolCallEntry = FinalizedToolCallDecision | (() => Promise<FinalizedToolCallDecision>);
@@ -594,6 +766,7 @@ async function prepareToolCall(
 	toolCall: AgentToolCall,
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
+	runtime: LoopRuntime,
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
 	if (!tool) {
@@ -601,30 +774,70 @@ async function prepareToolCall(
 			kind: "immediate",
 			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
 			isError: true,
+			status: "failure",
 		};
 	}
 
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
 		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		const hookContext = {
+			assistantMessage,
+			toolCall,
+			args: validatedArgs,
+			context: currentContext,
+		};
+
 		if (config.beforeToolCall) {
-			const beforeResult = await config.beforeToolCall(
-				{
-					assistantMessage,
-					toolCall,
-					args: validatedArgs,
-					context: currentContext,
-				},
-				signal,
-			);
+			const beforeResult = await config.beforeToolCall(hookContext, signal);
 			if (beforeResult?.block) {
 				return {
 					kind: "immediate",
 					result: createErrorToolResult(beforeResult.reason || "Tool execution was blocked"),
 					isError: true,
+					status: "failure",
 				};
 			}
 		}
+
+		if (config.handleToolCall) {
+			const handlerResult = await config.handleToolCall(
+				{
+					...hookContext,
+					dispatch: (request) => runBranch(request, currentContext, config, signal, runtime),
+				},
+				signal,
+			);
+			if (!handlerResult) {
+				return {
+					kind: "prepared",
+					toolCall,
+					tool,
+					args: validatedArgs,
+				};
+			}
+			if (handlerResult.status !== "execute") {
+				return {
+					kind: "immediate",
+					result: handlerResult.result,
+					isError: handlerResult.status !== "success",
+					status: handlerResult.status,
+				};
+			}
+			if (handlerResult.arguments !== undefined) {
+				const nextToolCall = prepareToolCallArguments(tool, {
+					...preparedToolCall,
+					arguments: handlerResult.arguments as Record<string, any>,
+				});
+				return {
+					kind: "prepared",
+					toolCall: nextToolCall,
+					tool,
+					args: validateToolArguments(tool, nextToolCall),
+				};
+			}
+		}
+
 		return {
 			kind: "prepared",
 			toolCall,
@@ -636,6 +849,7 @@ async function prepareToolCall(
 			kind: "immediate",
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,
+			status: "failure",
 		};
 	}
 }
@@ -838,6 +1052,7 @@ async function finalizeExecutedToolCall(
 		toolCall: prepared.toolCall,
 		result,
 		isError,
+		status: isError ? "failure" : "success",
 	};
 }
 
@@ -867,6 +1082,13 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		details: finalized.result.details,
 		isError: finalized.isError,
 		timestamp: Date.now(),
+	};
+}
+
+function createToolResultOutcome(finalized: FinalizedToolCallOutcome): ToolResultOutcome {
+	return {
+		message: createToolResultMessage(finalized),
+		status: finalized.status ?? (finalized.isError ? "failure" : "success"),
 	};
 }
 
